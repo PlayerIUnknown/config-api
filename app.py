@@ -109,16 +109,14 @@ async def get_config(api_key: str = Depends(get_api_key)):
         quality_gates = tenant.get("quality_gates", {})
         subscription_tier = tenant.get("subscription_tier", "free")
         
-        # Validate required config fields
+        # If no custom config, default to master database
         if not config_supabase_url or not config_supabase_service_key:
-            logger.error(f"Tenant {tenant.get('id')} missing Supabase configuration")
-            raise HTTPException(
-                status_code=500, 
-                detail="Tenant configuration incomplete. Please contact support."
-            )
+            logger.info(f"Tenant {tenant.get('id')} using master database (no custom config)")
+            config_supabase_url = MASTER_SUPABASE_URL
+            config_supabase_service_key = MASTER_SUPABASE_KEY
         
         # Log successful config retrieval
-        logger.info(f"Config retrieved for tenant: {tenant.get('name', 'Unknown')} (ID: {tenant.get('id')})")
+        logger.info(f"Config retrieved for tenant: {tenant.get('name', 'Unknown')} (ID: {tenant.get('id')}) - Using: {'Master DB' if config_supabase_url == MASTER_SUPABASE_URL else 'Custom DB'}")
         
         return ConfigResponse(
             tenant_id=str(tenant.get("id")),
