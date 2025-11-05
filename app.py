@@ -159,6 +159,29 @@ class DashboardSummaryResponse(BaseModel):
     repos: dict
     last_scan_at: Optional[str] = None
 
+class TenantProfileResponse(BaseModel):
+    status: str = "success"
+    tenant_id: str
+    name: str
+    email: str
+    api_key: str
+    subscription_tier: str
+    quality_gates: dict
+
+class UpdateQualityGatesRequest(BaseModel):
+    enabled: Optional[bool] = None
+    max_critical: Optional[int] = None
+    max_high: Optional[int] = None
+    max_medium: Optional[int] = None
+    max_low: Optional[int] = None
+    fail_on_secrets: Optional[bool] = None
+    fail_on_critical_code_issues: Optional[bool] = None
+
+class UpdateQualityGatesResponse(BaseModel):
+    status: str = "success"
+    message: str
+    quality_gates: dict
+
 # Helper functions
 def get_api_key(x_api_key: Optional[str] = Security(api_key_header)):
     """Extract API key from header"""
@@ -846,10 +869,124 @@ async def repos_grouped(payload: dict = Depends(get_jwt_token)):
         logger.error(f"repos_grouped error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
+@app.get("/v1/tenant/profile", response_model=TenantProfileResponse)
+async def get_tenant_profile(payload: dict = Depends(get_jwt_token)):
+    """Get tenant profile including API key for authenticated user"""
+    try:
+        tenant_id = payload.get("tenant_id")
+        if not tenant_id:
+            raise HTTPException(status_code=401, detail="Invalid token: missing tenant_id")
+        
+        response = httpx.get(
+            f"{MASTER_SUPABASE_URL}/rest/v1/tenants",
+            headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{tenant_id}", "select": "id,name,email,api_key,subscription_tier,quality_gates"}
+        )
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to query tenant database")
+        
+        tenants = response.json()
+        if not tenants:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+        
+        tenant = tenants[0]
+        quality_gates = tenant.get("quality_gates", {})
+        if not isinstance(quality_gates, dict):
+            quality_gates = {}
+        
+        return TenantProfileResponse(
+            tenant_id=str(tenant.get("id")),
+            name=tenant.get("name", ""),
+            email=tenant.get("email", ""),
+            api_key=tenant.get("api_key", ""),
+            subscription_tier=tenant.get("subscription_tier", "free"),
+            quality_gates=quality_gates
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching tenant profile: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.put("/v1/tenant/quality-gates", response_model=UpdateQualityGatesResponse)
+async def update_quality_gates(
+    request: UpdateQualityGatesRequest,
+    payload: dict = Depends(get_jwt_token)
+):
+    """Update quality gate configuration for authenticated tenant"""
+    try:
+        tenant_id = payload.get("tenant_id")
+        if not tenant_id:
+            raise HTTPException(status_code=401, detail="Invalid token: missing tenant_id")
+        
+        # Get current quality gates
+        get_response = httpx.get(
+            f"{MASTER_SUPABASE_URL}/rest/v1/tenants",
+            headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{tenant_id}", "select": "quality_gates"}
+        )
+        
+        if get_response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to query tenant")
+        
+        tenants = get_response.json()
+        if not tenants:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+        
+        current_qg = tenants[0].get("quality_gates", {})
+        if not isinstance(current_qg, dict):
+            current_qg = {}
+        
+        # Merge with defaults
+        default_qg = {
+            "enabled": True,
+            "max_critical": 0,
+            "max_high": 5,
+            "max_medium": 20,
+            "max_low": 100,
+            "fail_on_secrets": True,
+            "fail_on_critical_code_issues": True
+        }
+        
+        # Start with defaults, then current, then new values
+        updated_qg = {**default_qg, **current_qg}
+        
+        # Update only provided fields
+        update_data = request.dict(exclude_unset=True)
+        updated_qg.update(update_data)
+        
+        # Update in database
+        update_response = httpx.patch(
+            f"{MASTER_SUPABASE_URL}/rest/v1/tenants",
+            headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{tenant_id}"},
+            json={"quality_gates": updated_qg}
+        )
+        
+        if update_response.status_code not in [200, 204]:
+            logger.error(f"Failed to update quality gates: {update_response.text}")
+            raise HTTPException(status_code=500, detail="Failed to update quality gates")
+        
+        logger.info(f"Quality gates updated for tenant: {tenant_id}")
+        
+        return UpdateQualityGatesResponse(
+            message="Quality gates updated successfully",
+            quality_gates=updated_qg
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating quality gates: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
 @app.get("/v1/config", response_model=ConfigResponse)
 async def get_config(api_key: str = Depends(get_api_key)):
     """
-    Get tenant configuration by API key (legacy endpoint, kept for compatibility)
+    Get tenant configuration by API key (legacy endpoint, kept for scanner compatibility)
+    DEPRECATED: Use /v1/tenant/profile for dashboard access
     """
     try:
         response = httpx.get(
