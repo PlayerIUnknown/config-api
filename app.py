@@ -4,7 +4,7 @@ Aegis Config API - Middleware service for authentication, config retrieval, and 
 Handles JWT authentication, quality gate configuration, and scan result storage
 """
 
-from fastapi import FastAPI, Header, HTTPException, Depends, Query
+from fastapi import FastAPI, Header, HTTPException, Depends, Query, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -132,7 +132,7 @@ class ReposResponse(BaseModel):
     count: int
 
 # Helper functions
-def get_api_key(x_api_key: Optional[str] = Depends(api_key_header)):
+def get_api_key(x_api_key: Optional[str] = Security(api_key_header)):
     """Extract API key from header"""
     if not x_api_key:
         raise HTTPException(status_code=401, detail="API key required. Provide X-API-Key header")
@@ -148,7 +148,7 @@ def verify_jwt_token(token: str) -> dict:
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-def get_jwt_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)):
+def get_jwt_token(credentials: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme)):
     """Extract JWT token from Authorization: Bearer <token>"""
     if not credentials or not credentials.scheme or credentials.scheme.lower() != "bearer":
         raise HTTPException(status_code=401, detail="Authorization header required")
