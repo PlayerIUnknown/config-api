@@ -5,6 +5,7 @@ Handles JWT authentication, quality gate configuration, and scan result storage
 """
 
 from fastapi import FastAPI, Header, HTTPException, Depends, Query
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Optional
@@ -22,6 +23,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Aegis Config API", version="2.0.0")
+# Security schemes for OpenAPI (/docs)
+bearer_scheme = HTTPBearer(auto_error=False)
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
 
 # CORS middleware
 app.add_middleware(
@@ -127,7 +132,7 @@ class ReposResponse(BaseModel):
     count: int
 
 # Helper functions
-def get_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+def get_api_key(x_api_key: Optional[str] = Depends(api_key_header)):
     """Extract API key from header"""
     if not x_api_key:
         raise HTTPException(status_code=401, detail="API key required. Provide X-API-Key header")
@@ -143,15 +148,11 @@ def verify_jwt_token(token: str) -> dict:
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-def get_jwt_token(authorization: Optional[str] = Header(None)):
-    """Extract JWT token from Authorization header"""
-    if not authorization:
+def get_jwt_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)):
+    """Extract JWT token from Authorization: Bearer <token>"""
+    if not credentials or not credentials.scheme or credentials.scheme.lower() != "bearer":
         raise HTTPException(status_code=401, detail="Authorization header required")
-    
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization format. Use 'Bearer <token>'")
-    
-    token = authorization.replace("Bearer ", "")
+    token = credentials.credentials
     return verify_jwt_token(token)
 
 def _extract_repo(results: dict) -> dict:
@@ -212,6 +213,7 @@ async def register(request: RegisterRequest):
             json={
                 "id": tenant_id,
                 "name": request.name,
+                "email": request.email,
                 "api_key": api_key,
                 "subscription_tier": "free"
             }
