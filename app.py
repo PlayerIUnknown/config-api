@@ -4,7 +4,7 @@ Aegis Config API - Middleware service for authentication, config retrieval, and 
 Handles JWT authentication, quality gate configuration, and scan result storage
 """
 
-from fastapi import FastAPI, Header, HTTPException, Depends
+from fastapi import FastAPI, Header, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Optional
@@ -88,6 +88,44 @@ class StoreResultsRequest(BaseModel):
     quality_gate_passed: bool
     quality_gate_reasons: list
 
+# New response models
+class ScanItem(BaseModel):
+    id: str
+    timestamp: str
+    scan_type: str
+    target_path: Optional[str] = None
+    status: str
+    quality_gate_passed: Optional[bool] = None
+    quality_gate_reasons: Optional[list] = None
+    repository: Optional[dict] = None
+    summary: Optional[dict] = None
+
+class ScansListResponse(BaseModel):
+    status: str = "success"
+    items: list[ScanItem]
+    count: int
+
+class ScansSummaryResponse(BaseModel):
+    status: str = "success"
+    totals: dict
+    by_status: dict
+    quality_gate: dict
+    last_scan_at: Optional[str] = None
+
+class RepoCommitItem(BaseModel):
+    repo_name: Optional[str] = None
+    branch: Optional[str] = None
+    commit_hash: Optional[str] = None
+    timestamp: str
+    status: str
+    quality_gate_passed: Optional[bool] = None
+    summary: Optional[dict] = None
+
+class ReposResponse(BaseModel):
+    status: str = "success"
+    items: list[RepoCommitItem]
+    count: int
+
 # Helper functions
 def get_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
     """Extract API key from header"""
@@ -115,6 +153,18 @@ def get_jwt_token(authorization: Optional[str] = Header(None)):
     
     token = authorization.replace("Bearer ", "")
     return verify_jwt_token(token)
+
+def _extract_repo(results: dict) -> dict:
+    try:
+        return (results or {}).get("metadata", {}).get("repository", {})
+    except Exception:
+        return {}
+
+def _extract_summary(results: dict) -> dict:
+    try:
+        return (results or {}).get("summary", {})
+    except Exception:
+        return {}
 
 def hash_password(password: str) -> str:
     """Hash password using bcrypt"""
@@ -363,6 +413,167 @@ async def store_results(request: StoreResultsRequest, api_key: str = Depends(get
     except Exception as e:
         logger.error(f"Error storing results: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+# =============================
+# Authenticated Scan Endpoints
+# =============================
+
+@app.get("/v1/scans", response_model=ScansListResponse)
+async def list_scans(
+    payload: dict = Depends(get_jwt_token),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    status: Optional[str] = Query(None, regex="^(running|completed|failed)$")
+):
+    """List complete scan details for the authenticated tenant (paginated)."""
+    try:
+        tenant_id = payload.get("tenant_id")
+        if not tenant_id:
+            raise HTTPException(status_code=401, detail="Invalid token: missing tenant_id")
+
+        params = {
+            "tenant_id": f"eq.{tenant_id}",
+            "select": "id,timestamp,scan_type,target_path,status,quality_gate_passed,quality_gate_reasons,results",
+            "order": "timestamp.desc",
+            "limit": str(limit),
+            "offset": str(offset)
+        }
+        if status:
+            params["status"] = f"eq.{status}"
+
+        resp = httpx.get(
+            f"{MASTER_SUPABASE_URL}/rest/v1/scan_results",
+            headers=SUPABASE_HEADERS,
+            params=params,
+            timeout=60.0
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to fetch scans")
+
+        rows = resp.json() or []
+        items: list[ScanItem] = []
+        for r in rows:
+            repo = _extract_repo(r.get("results"))
+            summary = _extract_summary(r.get("results"))
+            items.append(ScanItem(
+                id=str(r.get("id")),
+                timestamp=r.get("timestamp"),
+                scan_type=r.get("scan_type"),
+                target_path=r.get("target_path"),
+                status=r.get("status"),
+                quality_gate_passed=r.get("quality_gate_passed"),
+                quality_gate_reasons=r.get("quality_gate_reasons"),
+                repository=repo,
+                summary=summary
+            ))
+
+        return ScansListResponse(items=items, count=len(items))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"list_scans error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/v1/scans/summary", response_model=ScansSummaryResponse)
+async def scans_summary(
+    payload: dict = Depends(get_jwt_token)
+):
+    """Aggregate summary for all scans of the authenticated tenant."""
+    try:
+        tenant_id = payload.get("tenant_id")
+        if not tenant_id:
+            raise HTTPException(status_code=401, detail="Invalid token: missing tenant_id")
+
+        resp = httpx.get(
+            f"{MASTER_SUPABASE_URL}/rest/v1/scan_results",
+            headers=SUPABASE_HEADERS,
+            params={
+                "tenant_id": f"eq.{tenant_id}",
+                "select": "timestamp,status,quality_gate_passed,results",
+                "order": "timestamp.desc",
+            },
+            timeout=60.0
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to fetch scans")
+
+        rows = resp.json() or []
+        totals = {"scans": len(rows)}
+        by_status = {"running": 0, "completed": 0, "failed": 0}
+        qg = {"passed": 0, "failed": 0}
+        last_scan_at = rows[0]["timestamp"] if rows else None
+
+        for r in rows:
+            st = r.get("status") or "completed"
+            if st in by_status:
+                by_status[st] += 1
+            if r.get("quality_gate_passed") is True:
+                qg["passed"] += 1
+            elif r.get("quality_gate_passed") is False:
+                qg["failed"] += 1
+
+        return ScansSummaryResponse(
+            totals=totals,
+            by_status=by_status,
+            quality_gate=qg,
+            last_scan_at=last_scan_at
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"scans_summary error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/v1/repos", response_model=ReposResponse)
+async def repos_and_commits(
+    payload: dict = Depends(get_jwt_token),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0)
+):
+    """Repo and commit metadata for the authenticated tenant with status and summaries."""
+    try:
+        tenant_id = payload.get("tenant_id")
+        if not tenant_id:
+            raise HTTPException(status_code=401, detail="Invalid token: missing tenant_id")
+
+        resp = httpx.get(
+            f"{MASTER_SUPABASE_URL}/rest/v1/scan_results",
+            headers=SUPABASE_HEADERS,
+            params={
+                "tenant_id": f"eq.{tenant_id}",
+                "select": "timestamp,status,results,quality_gate_passed",
+                "order": "timestamp.desc",
+                "limit": str(limit),
+                "offset": str(offset)
+            },
+            timeout=60.0
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to fetch scans")
+
+        rows = resp.json() or []
+        items: list[RepoCommitItem] = []
+        for r in rows:
+            repo = _extract_repo(r.get("results"))
+            summary = _extract_summary(r.get("results"))
+            items.append(RepoCommitItem(
+                repo_name=repo.get("repo_name"),
+                branch=repo.get("branch"),
+                commit_hash=repo.get("commit_hash"),
+                timestamp=r.get("timestamp"),
+                status=r.get("status"),
+                quality_gate_passed=r.get("quality_gate_passed"),
+                summary=summary
+            ))
+
+        return ReposResponse(items=items, count=len(items))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"repos_and_commits error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/v1/config", response_model=ConfigResponse)
 async def get_config(api_key: str = Depends(get_api_key)):
